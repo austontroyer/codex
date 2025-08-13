@@ -125,21 +125,23 @@ impl ChatWidget<'_> {
             return Vec::new();
         }
 
-        // Normalize curly quotes and non-breaking spaces that commonly appear in macOS filenames.
+        // Normalize curly quotes that commonly appear in macOS filenames, but
+        // DO NOT replace NBSP variants here. Some macOS screenshot filenames
+        // include a narrow no‑break space before AM/PM; replacing it with a
+        // regular space would make the path not match the on‑disk filename.
         let mut normalized = text
             .replace('\u{2018}', "'")  // ‘
             .replace('\u{2019}', "'")  // ’
             .replace('\u{201C}', "\"") // “
-            .replace('\u{201D}', "\"") // ”
-            .replace('\u{00A0}', " ")    // NBSP
-            .replace('\u{202F}', " ");   // NNBSP
+            .replace('\u{201D}', "\""); // ”
 
         // Extract obvious candidates via regex too (robust against odd quoting and punctuation).
         // We combine both regex captures and shlex tokens to maximize recall.
         let mut candidates: Vec<String> = Vec::new();
         {
             // Keep pattern simple to avoid engine differences.
-            let pattern = "(?xi)(file://[^\\s]+)|(/[^\\s'\\\"]+\\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg))|([A-Za-z0-9_\\-\\s\\.]+\\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg))";
+            // Allow spaces in absolute paths (stop at quotes), match file:// URLs and bare filenames.
+            let pattern = "(?xi)(file://[^\\s]+)|(/[^'\\\"]+\\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg))|([A-Za-z0-9_\\-\\s\\.]+\\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg))";
             if let Ok(re) = regex_lite::Regex::new(pattern) {
                 for cap in re.captures_iter(&normalized) {
                     if let Some(m) = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)) {
@@ -166,6 +168,10 @@ impl ChatWidget<'_> {
             let mut s = tok.replace("\\ ", " ");
             // Strip trivial trailing punctuation that often follows paths in prose.
             s = s.trim_end_matches([',', '.', ';', ':']).to_string();
+            // Strip surrounding straight quotes if present (common when dragging paths).
+            if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
+                s = s[1..s.len() - 1].to_string();
+            }
             s
         }
 
@@ -199,17 +205,55 @@ impl ChatWidget<'_> {
 
         // If a candidate path does not exist, attempt to resolve by basename in common locations.
         fn resolve_by_basename(basename: &str, home: &Path, cwd: &Path) -> Option<PathBuf> {
-            let candidates = [
+            // First try exact joins in common locations.
+            let exact_candidates = [
                 cwd.join(basename),
                 home.join("Desktop").join(basename),
                 home.join("Downloads").join(basename),
                 home.join("Pictures").join(basename),
                 home.join("Pictures").join("Screenshots").join(basename),
             ];
-            for p in candidates.into_iter() {
+            for p in exact_candidates.into_iter() {
                 if let Ok(meta) = std::fs::metadata(&p) {
                     if meta.is_file() {
                         return Some(p);
+                    }
+                }
+            }
+            
+            // If not found, do a best‑effort scan of those same directories
+            // and match filenames after normalizing NBSP/NNBSP to regular
+            // spaces so that macOS screenshot names like "11.53.36\u{202F}AM"
+            // are located even if the pasted path used an ASCII space.
+            fn norm_spaces(s: &str) -> String {
+                s.chars()
+                    .map(|ch| match ch {
+                        '\u{00A0}' | '\u{202F}' => ' ', // NBSP / NNBSP → ASCII space
+                        other => other,
+                    })
+                    .collect::<String>()
+            }
+
+            let norm_basename = norm_spaces(basename);
+            let scan_dirs = [
+                cwd.to_path_buf(),
+                home.join("Desktop"),
+                home.join("Downloads"),
+                home.join("Pictures"),
+                home.join("Pictures").join("Screenshots"),
+            ];
+            for dir in scan_dirs.into_iter() {
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for entry in rd.flatten() {
+                        let file_type_ok = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+                        if !file_type_ok {
+                            continue;
+                        }
+                        if let Some(name) = entry.file_name().to_str() {
+                            if norm_spaces(name) == norm_basename {
+                                return Some(entry.path());
+                            }
+                        }
                     }
                 }
             }
