@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_core::config::Config;
-use codex_core::parse_command::ParsedCommand;
 use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningDeltaEvent;
@@ -18,15 +18,19 @@ use codex_core::protocol::ExecApprovalRequestEvent;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::InputItem;
+use codex_core::protocol::McpListToolsResponseEvent;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
+use codex_core::protocol::StreamErrorEvent;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_core::protocol::TokenUsage;
 use codex_core::protocol::TurnDiffEvent;
+use codex_protocol::parse_command::ParsedCommand;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
+use rand::Rng;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
@@ -42,10 +46,16 @@ use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::InputResult;
-use crate::exec_command::strip_bash_lc_and_escape;
+use crate::bottom_pane::SelectionAction;
+use crate::bottom_pane::SelectionItem;
+use crate::get_git_diff::get_git_diff;
+use crate::history_cell;
 use crate::history_cell::CommandOutput;
+use crate::history_cell::ExecCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PatchEventType;
+use crate::slash_command::SlashCommand;
+use crate::tui::FrameRequester;
 // streaming internals are provided by crate::streaming and crate::markdown_stream
 use crate::user_approval_widget::ApprovalRequest;
 mod interrupts;
@@ -54,7 +64,16 @@ mod agent;
 use self::agent::spawn_agent;
 use crate::streaming::controller::AppEventHistorySink;
 use crate::streaming::controller::StreamController;
+use codex_common::approval_presets::ApprovalPreset;
+use codex_common::approval_presets::builtin_approval_presets;
+use codex_common::model_presets::ModelPreset;
+use codex_common::model_presets::builtin_model_presets;
+use codex_core::ConversationManager;
+use codex_core::protocol::AskForApproval;
+use codex_core::protocol::SandboxPolicy;
+use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_file_search::FileMatch;
+use uuid::Uuid;
 
 // Track information about an in-flight exec command.
 struct RunningCommand {
@@ -62,35 +81,36 @@ struct RunningCommand {
     parsed_cmd: Vec<ParsedCommand>,
 }
 
-pub(crate) struct ChatWidget<'a> {
+pub(crate) struct ChatWidget {
     app_event_tx: AppEventSender,
     codex_op_tx: UnboundedSender<Op>,
-    bottom_pane: BottomPane<'a>,
-    active_exec_cell: Option<HistoryCell>,
+    bottom_pane: BottomPane,
+    active_exec_cell: Option<ExecCell>,
     config: Config,
     initial_user_message: Option<UserMessage>,
     total_token_usage: TokenUsage,
     last_token_usage: TokenUsage,
     // Stream lifecycle controller
     stream: StreamController,
-    // Track the most recently active stream kind in the current turn
-    last_stream_kind: Option<StreamKind>,
     running_commands: HashMap<String, RunningCommand>,
+    pending_exec_completions: Vec<(Vec<String>, Vec<ParsedCommand>, CommandOutput)>,
     task_complete_pending: bool,
     // Queue of interruptive UI events deferred during an active write cycle
     interrupts: InterruptManager,
     // Whether a redraw is needed after handling the current event
     needs_redraw: bool,
-    // Image paths captured from paste events during composition
-    pending_image_paths: Vec<PathBuf>,
+    // Accumulates the current reasoning block text to extract a header
+    reasoning_buffer: String,
+    // Accumulates full reasoning content for transcript-only recording
+    full_reasoning_buffer: String,
+    session_id: Option<Uuid>,
+    frame_requester: FrameRequester,
 }
 
 struct UserMessage {
     text: String,
     image_paths: Vec<PathBuf>,
 }
-
-use crate::streaming::StreamKind;
 
 impl From<String> for UserMessage {
     fn from(text: String) -> Self {
@@ -109,232 +129,21 @@ fn create_initial_user_message(text: String, image_paths: Vec<PathBuf>) -> Optio
     }
 }
 
-impl ChatWidget<'_> {
-    /// Best-effort detection of image file paths in the submitted text.
-    ///
-    /// This enables simple workflows like dragging a file from Finder into the
-    /// terminal (which typically inserts a POSIX path with spaces escaped) or
-    /// pasting a path directly. Any detected images are attached in addition to
-    /// the raw text so the model can see the content.
-    fn detect_image_paths_in_text(&self, text: &str) -> Vec<PathBuf> {
-        use std::collections::HashSet;
-        use std::path::{Path, PathBuf};
-
-        // Quick guard: avoid work for short texts.
-        if text.trim().is_empty() {
-            return Vec::new();
-        }
-
-        // Normalize curly quotes that commonly appear in macOS filenames, but
-        // DO NOT replace NBSP variants here. Some macOS screenshot filenames
-        // include a narrow no‑break space before AM/PM; replacing it with a
-        // regular space would make the path not match the on‑disk filename.
-        let mut normalized = text
-            .replace('\u{2018}', "'")  // ‘
-            .replace('\u{2019}', "'")  // ’
-            .replace('\u{201C}', "\"") // “
-            .replace('\u{201D}', "\""); // ”
-
-        // Extract obvious candidates via regex too (robust against odd quoting and punctuation).
-        // We combine both regex captures and shlex tokens to maximize recall.
-        let mut candidates: Vec<String> = Vec::new();
-        {
-            // Keep pattern simple to avoid engine differences.
-            // Allow spaces in absolute paths (stop at quotes), match file:// URLs and bare filenames.
-            let pattern = "(?xi)(file://[^\\s]+)|(/[^'\\\"]+\\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg))|([A-Za-z0-9_\\-\\s\\.]+\\.(?:png|jpe?g|gif|webp|bmp|tiff?|svg))";
-            if let Ok(re) = regex_lite::Regex::new(pattern) {
-                for cap in re.captures_iter(&normalized) {
-                    if let Some(m) = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)) {
-                        candidates.push(m.as_str().to_string());
-                    }
-                }
-            }
-        }
-
-        // shlex-like tokenization to respect quotes; fall back to whitespace split if needed.
-        {
-            let mut lexer = shlex::Shlex::new(&normalized);
-            for item in &mut lexer {
-                candidates.push(item);
-            }
-            if candidates.is_empty() {
-                candidates.extend(normalized.split_whitespace().map(|s| s.to_string()));
-            }
-        }
-
-        // Very small helper to unescape common terminal drag patterns.
-        fn normalize_token(tok: &str) -> String {
-            // Handle typical terminal escaping of spaces.
-            let mut s = tok.replace("\\ ", " ");
-            // Strip trivial trailing punctuation that often follows paths in prose.
-            s = s.trim_end_matches([',', '.', ';', ':']).to_string();
-            // Strip surrounding straight quotes if present (common when dragging paths).
-            if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
-                s = s[1..s.len() - 1].to_string();
-            }
-            s
-        }
-
-        fn from_file_url(url: &str) -> Option<PathBuf> {
-            // Accept file:///path or file://localhost/path
-            let rest = url.strip_prefix("file://")?;
-            let path = if let Some(stripped) = rest.strip_prefix("localhost") {
-                stripped
-            } else {
-                rest
-            };
-            // Very lightweight percent-decoding for spaces only to avoid new deps.
-            let p = path.replace("%20", " ");
-            if p.starts_with('/') {
-                Some(PathBuf::from(p))
-            } else {
-                None
-            }
-        }
-
-        fn looks_like_image_path(p: &Path) -> bool {
-            match p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
-                Some(ext)
-                    if matches!(
-                        ext.as_str(),
-                        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "svg"
-                    ) => true,
-                _ => false,
-            }
-        }
-
-        // If a candidate path does not exist, attempt to resolve by basename in common locations.
-        fn resolve_by_basename(basename: &str, home: &Path, cwd: &Path) -> Option<PathBuf> {
-            // First try exact joins in common locations.
-            let exact_candidates = [
-                cwd.join(basename),
-                home.join("Desktop").join(basename),
-                home.join("Downloads").join(basename),
-                home.join("Pictures").join(basename),
-                home.join("Pictures").join("Screenshots").join(basename),
-            ];
-            for p in exact_candidates.into_iter() {
-                if let Ok(meta) = std::fs::metadata(&p) {
-                    if meta.is_file() {
-                        return Some(p);
-                    }
-                }
-            }
-            
-            // If not found, do a best‑effort scan of those same directories
-            // and match filenames after normalizing NBSP/NNBSP to regular
-            // spaces so that macOS screenshot names like "11.53.36\u{202F}AM"
-            // are located even if the pasted path used an ASCII space.
-            fn norm_spaces(s: &str) -> String {
-                s.chars()
-                    .map(|ch| match ch {
-                        '\u{00A0}' | '\u{202F}' => ' ', // NBSP / NNBSP → ASCII space
-                        other => other,
-                    })
-                    .collect::<String>()
-            }
-
-            let norm_basename = norm_spaces(basename);
-            let scan_dirs = [
-                cwd.to_path_buf(),
-                home.join("Desktop"),
-                home.join("Downloads"),
-                home.join("Pictures"),
-                home.join("Pictures").join("Screenshots"),
-            ];
-            for dir in scan_dirs.into_iter() {
-                if let Ok(rd) = std::fs::read_dir(&dir) {
-                    for entry in rd.flatten() {
-                        let file_type_ok = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
-                        if !file_type_ok {
-                            continue;
-                        }
-                        if let Some(name) = entry.file_name().to_str() {
-                            if norm_spaces(name) == norm_basename {
-                                return Some(entry.path());
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        }
-
-        let mut out: Vec<PathBuf> = Vec::new();
-        let mut seen: HashSet<PathBuf> = HashSet::new();
-        let cwd = &self.config.cwd;
-
-        for raw_tok in candidates {
-            if raw_tok.is_empty() {
-                continue;
-            }
-
-            let candidate = if raw_tok.starts_with("file://") {
-                from_file_url(&raw_tok)
-            } else {
-                let norm = normalize_token(&raw_tok);
-                // Expand ~ at start.
-                let expanded = if let Some(rest) = norm.strip_prefix("~/") {
-                    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                        home.join(rest)
-                    } else {
-                        PathBuf::from(norm)
-                    }
-                } else {
-                    PathBuf::from(norm)
-                };
-
-                // Resolve against configured cwd if relative.
-                let abs = if expanded.is_absolute() {
-                    expanded
-                } else {
-                    cwd.join(expanded)
-                };
-                Some(abs)
-            };
-
-            let Some(mut path) = candidate else { continue };
-            // Cheap extension filter first.
-            if !looks_like_image_path(&path) {
-                continue;
-            }
-            // Ensure it exists and is a regular file.
-            let exists_and_file = std::fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false);
-            if !exists_and_file {
-                // Common macOS drag path is a TemporaryItems screenshot that is
-                // immediately moved to Desktop. Try to locate by basename.
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                        if let Some(found) = resolve_by_basename(name, &home, cwd) {
-                            path = found;
-                        } else {
-                            // Skip if we still can't find it.
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-            // Deduplicate and record
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
-        }
-
-        out
-    }
+impl ChatWidget {
     #[inline]
     fn mark_needs_redraw(&mut self) {
         self.needs_redraw = true;
+    }
+    fn flush_answer_stream_with_separator(&mut self) {
+        let sink = AppEventHistorySink(self.app_event_tx.clone());
+        let _ = self.stream.finalize(true, &sink);
     }
     // --- Small event handlers ---
     fn on_session_configured(&mut self, event: codex_core::protocol::SessionConfiguredEvent) {
         self.bottom_pane
             .set_history_metadata(event.history_log_id, event.history_entry_count);
-        self.add_to_history(HistoryCell::new_session_info(&self.config, event, true));
+        self.session_id = Some(event.session_id);
+        self.add_to_history(history_cell::new_session_info(&self.config, event, true));
         if let Some(user_message) = self.initial_user_message.take() {
             self.submit_user_message(user_message);
         }
@@ -349,23 +158,43 @@ impl ChatWidget<'_> {
     }
 
     fn on_agent_message_delta(&mut self, delta: String) {
-        self.handle_streaming_delta(StreamKind::Answer, delta);
+        self.handle_streaming_delta(delta);
     }
 
     fn on_agent_reasoning_delta(&mut self, delta: String) {
-        self.handle_streaming_delta(StreamKind::Reasoning, delta);
+        // For reasoning deltas, do not stream to history. Accumulate the
+        // current reasoning block and extract the first bold element
+        // (between **/**) as the chunk header. Show this header as status.
+        self.reasoning_buffer.push_str(&delta);
+
+        if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
+            // Update the shimmer header to the extracted reasoning chunk header.
+            self.bottom_pane.update_status_header(header);
+        } else {
+            // Fallback while we don't yet have a bold header: leave existing header as-is.
+        }
+        self.mark_needs_redraw();
     }
 
     fn on_agent_reasoning_final(&mut self) {
-        let sink = AppEventHistorySink(self.app_event_tx.clone());
-        let finished = self.stream.finalize(StreamKind::Reasoning, false, &sink);
-        self.handle_if_stream_finished(finished);
+        // At the end of a reasoning block, record transcript-only content.
+        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
+        if !self.full_reasoning_buffer.is_empty() {
+            self.add_to_history(history_cell::new_reasoning_block(
+                self.full_reasoning_buffer.clone(),
+                &self.config,
+            ));
+        }
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
         self.mark_needs_redraw();
     }
 
     fn on_reasoning_section_break(&mut self) {
-        let sink = AppEventHistorySink(self.app_event_tx.clone());
-        self.stream.insert_reasoning_section_break(&sink);
+        // Start a new reasoning block for header extraction and accumulate transcript.
+        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
+        self.full_reasoning_buffer.push_str("\n\n");
+        self.reasoning_buffer.clear();
     }
 
     // Raw reasoning uses the same flow as summarized reasoning
@@ -373,9 +202,9 @@ impl ChatWidget<'_> {
     fn on_task_started(&mut self) {
         self.bottom_pane.clear_ctrl_c_quit_hint();
         self.bottom_pane.set_task_running(true);
-        self.set_waiting_for_model_status();
         self.stream.reset_headers_for_new_turn();
-        self.last_stream_kind = None;
+        self.full_reasoning_buffer.clear();
+        self.reasoning_buffer.clear();
         self.mark_needs_redraw();
     }
 
@@ -384,12 +213,11 @@ impl ChatWidget<'_> {
         // without emitting stray headers for other streams.
         if self.stream.is_write_cycle_active() {
             let sink = AppEventHistorySink(self.app_event_tx.clone());
-            if let Some(kind) = self.last_stream_kind {
-                let _ = self.stream.finalize(kind, true, &sink);
-            }
+            let _ = self.stream.finalize(true, &sink);
         }
         // Mark task stopped and request redraw now that all content is in history.
         self.bottom_pane.set_task_running(false);
+        self.running_commands.clear();
         self.mark_needs_redraw();
     }
 
@@ -404,14 +232,15 @@ impl ChatWidget<'_> {
     }
 
     fn on_error(&mut self, message: String) {
-        self.add_to_history(HistoryCell::new_error_event(message));
+        self.add_to_history(history_cell::new_error_event(message));
         self.bottom_pane.set_task_running(false);
+        self.running_commands.clear();
         self.stream.clear_all();
         self.mark_needs_redraw();
     }
 
     fn on_plan_update(&mut self, update: codex_core::plan_tool::UpdatePlanArgs) {
-        self.add_to_history(HistoryCell::new_plan_update(update));
+        self.add_to_history(history_cell::new_plan_update(update));
     }
 
     fn on_exec_approval_request(&mut self, id: String, ev: ExecApprovalRequestEvent) {
@@ -433,6 +262,7 @@ impl ChatWidget<'_> {
     }
 
     fn on_exec_command_begin(&mut self, ev: ExecCommandBeginEvent) {
+        self.flush_answer_stream_with_separator();
         let ev2 = ev.clone();
         self.defer_or_handle(|q| q.push_exec_begin(ev), |s| s.handle_exec_begin_now(ev2));
     }
@@ -445,7 +275,7 @@ impl ChatWidget<'_> {
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
-        self.add_to_history(HistoryCell::new_patch_event(
+        self.add_to_history(history_cell::new_patch_event(
             PatchEventType::ApplyBegin {
                 auto_approved: event.auto_approved,
             },
@@ -500,6 +330,12 @@ impl ChatWidget<'_> {
     fn on_background_event(&mut self, message: String) {
         debug!("BackgroundEvent: {message}");
     }
+
+    fn on_stream_error(&mut self, message: String) {
+        // Show stream errors in the transcript so users see retry/backoff info.
+        self.add_to_history(history_cell::new_stream_error_event(message));
+        self.mark_needs_redraw();
+    }
     /// Periodic tick to commit at most one queued line to history with a small delay,
     /// animating the output.
     pub(crate) fn on_commit_tick(&mut self) {
@@ -545,29 +381,20 @@ impl ChatWidget<'_> {
     }
 
     #[inline]
-    fn set_waiting_for_model_status(&mut self) {
-        self.bottom_pane
-            .update_status_text("waiting for model".to_string());
-    }
-
-    #[inline]
-    fn handle_streaming_delta(&mut self, kind: StreamKind, delta: String) {
+    fn handle_streaming_delta(&mut self, delta: String) {
         let sink = AppEventHistorySink(self.app_event_tx.clone());
-        self.set_waiting_for_model_status();
-        self.stream.begin(kind, &sink);
-        self.last_stream_kind = Some(kind);
+        self.stream.begin(&sink);
         self.stream.push_and_maybe_commit(&delta, &sink);
         self.mark_needs_redraw();
     }
 
     pub(crate) fn handle_exec_end_now(&mut self, ev: ExecCommandEndEvent) {
         let running = self.running_commands.remove(&ev.call_id);
-        self.active_exec_cell = None;
         let (command, parsed) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd),
             None => (vec![ev.call_id.clone()], Vec::new()),
         };
-        self.add_to_history(HistoryCell::new_completed_exec_command(
+        self.pending_exec_completions.push((
             command,
             parsed,
             CommandOutput {
@@ -576,6 +403,16 @@ impl ChatWidget<'_> {
                 stderr: ev.stderr.clone(),
             },
         ));
+
+        if self.running_commands.is_empty() {
+            self.active_exec_cell = None;
+            let pending = std::mem::take(&mut self.pending_exec_completions);
+            for (command, parsed, output) in pending {
+                self.add_to_history(history_cell::new_completed_exec_command(
+                    command, parsed, output,
+                ));
+            }
+        }
     }
 
     pub(crate) fn handle_patch_apply_end_now(
@@ -583,24 +420,14 @@ impl ChatWidget<'_> {
         event: codex_core::protocol::PatchApplyEndEvent,
     ) {
         if event.success {
-            self.add_to_history(HistoryCell::new_patch_apply_success(event.stdout));
+            self.add_to_history(history_cell::new_patch_apply_success(event.stdout));
         } else {
-            self.add_to_history(HistoryCell::new_patch_apply_failure(event.stderr));
+            self.add_to_history(history_cell::new_patch_apply_failure(event.stderr));
         }
     }
 
     pub(crate) fn handle_exec_approval_now(&mut self, id: String, ev: ExecApprovalRequestEvent) {
-        // Log a background summary immediately so the history is chronological.
-        let cmdline = strip_bash_lc_and_escape(&ev.command);
-        let text = format!(
-            "command requires approval:\n$ {cmdline}{reason}",
-            reason = ev
-                .reason
-                .as_ref()
-                .map(|r| format!("\n{r}"))
-                .unwrap_or_default()
-        );
-        self.add_to_history(HistoryCell::new_background_event(text));
+        self.flush_answer_stream_with_separator();
 
         let request = ApprovalRequest::Exec {
             id,
@@ -616,7 +443,8 @@ impl ChatWidget<'_> {
         id: String,
         ev: ApplyPatchApprovalRequestEvent,
     ) {
-        self.add_to_history(HistoryCell::new_patch_event(
+        self.flush_answer_stream_with_separator();
+        self.add_to_history(history_cell::new_patch_event(
             PatchEventType::ApprovalRequest,
             ev.changes.clone(),
         ));
@@ -632,8 +460,6 @@ impl ChatWidget<'_> {
 
     pub(crate) fn handle_exec_begin_now(&mut self, ev: ExecCommandBeginEvent) {
         // Ensure the status indicator is visible while the command runs.
-        self.bottom_pane
-            .update_status_text("running command".to_string());
         self.running_commands.insert(
             ev.call_id.clone(),
             RunningCommand {
@@ -641,17 +467,30 @@ impl ChatWidget<'_> {
                 parsed_cmd: ev.parsed_cmd.clone(),
             },
         );
-        self.active_exec_cell = Some(HistoryCell::new_active_exec_command(
-            ev.command,
-            ev.parsed_cmd,
-        ));
+        // Accumulate parsed commands into a single active Exec cell so they stack
+        match self.active_exec_cell.as_mut() {
+            Some(exec) => {
+                exec.parsed.extend(ev.parsed_cmd);
+            }
+            _ => {
+                self.active_exec_cell = Some(history_cell::new_active_exec_command(
+                    ev.command,
+                    ev.parsed_cmd,
+                ));
+            }
+        }
+
+        // Request a redraw so the working header and command list are visible immediately.
+        self.mark_needs_redraw();
     }
 
     pub(crate) fn handle_mcp_begin_now(&mut self, ev: McpToolCallBeginEvent) {
-        self.add_to_history(HistoryCell::new_active_mcp_tool_call(ev.invocation));
+        self.flush_answer_stream_with_separator();
+        self.add_to_history(history_cell::new_active_mcp_tool_call(ev.invocation));
     }
     pub(crate) fn handle_mcp_end_now(&mut self, ev: McpToolCallEndEvent) {
-        self.add_to_history(HistoryCell::new_completed_mcp_tool_call(
+        self.flush_answer_stream_with_separator();
+        self.add_boxed_history(history_cell::new_completed_mcp_tool_call(
             80,
             ev.invocation,
             ev.duration,
@@ -665,6 +504,7 @@ impl ChatWidget<'_> {
     fn interrupt_running_task(&mut self) {
         if self.bottom_pane.is_task_running() {
             self.active_exec_cell = None;
+            self.running_commands.clear();
             self.bottom_pane.clear_ctrl_c_quit_hint();
             self.submit_op(Op::Interrupt);
             self.bottom_pane.set_task_running(false);
@@ -686,20 +526,27 @@ impl ChatWidget<'_> {
 
     pub(crate) fn new(
         config: Config,
+        conversation_manager: Arc<ConversationManager>,
+        frame_requester: FrameRequester,
         app_event_tx: AppEventSender,
         initial_prompt: Option<String>,
         initial_images: Vec<PathBuf>,
         enhanced_keys_supported: bool,
     ) -> Self {
-        let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone());
+        let mut rng = rand::rng();
+        let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
+        let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
 
         Self {
             app_event_tx: app_event_tx.clone(),
+            frame_requester: frame_requester.clone(),
             codex_op_tx,
             bottom_pane: BottomPane::new(BottomPaneParams {
+                frame_requester,
                 app_event_tx,
                 has_input_focus: true,
                 enhanced_keys_supported,
+                placeholder_text: placeholder,
             }),
             active_exec_cell: None,
             config: config.clone(),
@@ -710,12 +557,14 @@ impl ChatWidget<'_> {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             stream: StreamController::new(config),
-            last_stream_kind: None,
             running_commands: HashMap::new(),
+            pending_exec_completions: Vec::new(),
             task_complete_pending: false,
             interrupts: InterruptManager::new(),
             needs_redraw: false,
-            pending_image_paths: Vec::new(),
+            reasoning_buffer: String::new(),
+            full_reasoning_buffer: String::new(),
+            session_id: None,
         }
     }
 
@@ -736,33 +585,129 @@ impl ChatWidget<'_> {
             InputResult::Submitted(text) => {
                 self.submit_user_message(text.into());
             }
+            InputResult::Command(cmd) => {
+                self.dispatch_command(cmd);
+            }
             InputResult::None => {}
         }
     }
 
-    pub(crate) fn handle_paste(&mut self, text: String) {
-        let detected = self.detect_image_paths_in_text(&text);
-        if !detected.is_empty() {
-            for p in detected {
-                if !self.pending_image_paths.contains(&p) {
-                    self.pending_image_paths.push(p);
+    fn dispatch_command(&mut self, cmd: SlashCommand) {
+        match cmd {
+            SlashCommand::New => {
+                self.app_event_tx.send(AppEvent::NewSession);
+            }
+            SlashCommand::Init => {
+                // Guard: do not run if a task is active.
+                const INIT_PROMPT: &str = include_str!("../prompt_for_init_command.md");
+                self.submit_text_message(INIT_PROMPT.to_string());
+            }
+            SlashCommand::Compact => {
+                self.clear_token_usage();
+                self.app_event_tx.send(AppEvent::CodexOp(Op::Compact));
+            }
+            SlashCommand::Model => {
+                self.open_model_popup();
+            }
+            SlashCommand::Approvals => {
+                self.open_approvals_popup();
+            }
+            SlashCommand::Quit => {
+                self.app_event_tx.send(AppEvent::ExitRequest);
+            }
+            SlashCommand::Logout => {
+                if let Err(e) = codex_login::logout(&self.config.codex_home) {
+                    tracing::error!("failed to logout: {e}");
                 }
+                self.app_event_tx.send(AppEvent::ExitRequest);
+            }
+            SlashCommand::Diff => {
+                self.add_diff_in_progress();
+                let tx = self.app_event_tx.clone();
+                tokio::spawn(async move {
+                    let text = match get_git_diff().await {
+                        Ok((is_git_repo, diff_text)) => {
+                            if is_git_repo {
+                                diff_text
+                            } else {
+                                "`/diff` — _not inside a git repository_".to_string()
+                            }
+                        }
+                        Err(e) => format!("Failed to compute diff: {e}"),
+                    };
+                    tx.send(AppEvent::DiffResult(text));
+                });
+            }
+            SlashCommand::Mention => {
+                self.insert_str("@");
+            }
+            SlashCommand::Status => {
+                self.add_status_output();
+            }
+            SlashCommand::Mcp => {
+                self.add_mcp_output();
+            }
+            #[cfg(debug_assertions)]
+            SlashCommand::TestApproval => {
+                use codex_core::protocol::EventMsg;
+                use std::collections::HashMap;
+
+                use codex_core::protocol::ApplyPatchApprovalRequestEvent;
+                use codex_core::protocol::FileChange;
+
+                self.app_event_tx.send(AppEvent::CodexEvent(Event {
+                    id: "1".to_string(),
+                    // msg: EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+                    //     call_id: "1".to_string(),
+                    //     command: vec!["git".into(), "apply".into()],
+                    //     cwd: self.config.cwd.clone(),
+                    //     reason: Some("test".to_string()),
+                    // }),
+                    msg: EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
+                        call_id: "1".to_string(),
+                        changes: HashMap::from([
+                            (
+                                PathBuf::from("/tmp/test.txt"),
+                                FileChange::Add {
+                                    content: "test".to_string(),
+                                },
+                            ),
+                            (
+                                PathBuf::from("/tmp/test2.txt"),
+                                FileChange::Update {
+                                    unified_diff: "+test\n-test2".to_string(),
+                                    move_path: None,
+                                },
+                            ),
+                        ]),
+                        reason: None,
+                        grant_root: Some(PathBuf::from("/tmp")),
+                    }),
+                }));
             }
         }
+    }
+
+    pub(crate) fn handle_paste(&mut self, text: String) {
         self.bottom_pane.handle_paste(text);
     }
 
     fn flush_active_exec_cell(&mut self) {
         if let Some(active) = self.active_exec_cell.take() {
             self.app_event_tx
-                .send(AppEvent::InsertHistory(active.plain_lines()));
+                .send(AppEvent::InsertHistoryCell(Box::new(active)));
         }
     }
 
-    fn add_to_history(&mut self, cell: HistoryCell) {
+    fn add_to_history(&mut self, cell: impl HistoryCell + 'static) {
         self.flush_active_exec_cell();
         self.app_event_tx
-            .send(AppEvent::InsertHistory(cell.plain_lines()));
+            .send(AppEvent::InsertHistoryCell(Box::new(cell)));
+    }
+
+    fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
+        self.flush_active_exec_cell();
+        self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
     }
 
     fn submit_user_message(&mut self, user_message: UserMessage) {
@@ -775,24 +720,6 @@ impl ChatWidget<'_> {
 
         for path in image_paths {
             items.push(InputItem::LocalImage { path });
-        }
-
-        // Include any images captured from paste events while composing.
-        if !self.pending_image_paths.is_empty() {
-            for path in self.pending_image_paths.drain(..) {
-                tracing::info!("Attaching image from paste: {}", path.display());
-                items.push(InputItem::LocalImage { path });
-            }
-        }
-
-        // Heuristically attach any image files referenced directly in the text.
-        // Keep the text unchanged; this preserves user intent while allowing the
-        // model to see the actual image content.
-        if !text.is_empty() {
-            for path in self.detect_image_paths_in_text(&text) {
-                tracing::info!("Attaching image from text: {}", path.display());
-                items.push(InputItem::LocalImage { path });
-            }
         }
 
         if items.is_empty() {
@@ -816,7 +743,7 @@ impl ChatWidget<'_> {
 
         // Only show the text portion in conversation history.
         if !text.is_empty() {
-            self.add_to_history(HistoryCell::new_user_prompt(text.clone()));
+            self.add_to_history(history_cell::new_user_prompt(text.clone()));
         }
     }
 
@@ -830,7 +757,7 @@ impl ChatWidget<'_> {
             | EventMsg::AgentReasoningDelta(_)
             | EventMsg::ExecCommandOutputDelta(_) => {}
             _ => {
-                tracing::info!("handle_codex_event: {:?}", msg);
+                tracing::trace!("handle_codex_event: {:?}", msg);
             }
         }
 
@@ -853,6 +780,7 @@ impl ChatWidget<'_> {
             EventMsg::TaskComplete(TaskCompleteEvent { .. }) => self.on_task_complete(),
             EventMsg::TokenCount(token_usage) => self.on_token_count(token_usage),
             EventMsg::Error(ErrorEvent { message }) => self.on_error(message),
+            EventMsg::TurnAborted(_) => self.on_error("Turn interrupted".to_owned()),
             EventMsg::PlanUpdate(update) => self.on_plan_update(update),
             EventMsg::ExecApprovalRequest(ev) => self.on_exec_approval_request(id, ev),
             EventMsg::ApplyPatchApprovalRequest(ev) => self.on_apply_patch_approval_request(id, ev),
@@ -864,11 +792,13 @@ impl ChatWidget<'_> {
             EventMsg::McpToolCallBegin(ev) => self.on_mcp_tool_call_begin(ev),
             EventMsg::McpToolCallEnd(ev) => self.on_mcp_tool_call_end(ev),
             EventMsg::GetHistoryEntryResponse(ev) => self.on_get_history_entry_response(ev),
+            EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ShutdownComplete => self.on_shutdown_complete(),
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => self.on_turn_diff(unified_diff),
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
                 self.on_background_event(message)
             }
+            EventMsg::StreamError(StreamErrorEvent { message }) => self.on_stream_error(message),
         }
         // Coalesce redraws: issue at most one after handling the event
         if self.needs_redraw {
@@ -877,30 +807,139 @@ impl ChatWidget<'_> {
         }
     }
 
-    /// Update the live log preview while a task is running.
-    pub(crate) fn update_latest_log(&mut self, line: String) {
-        if self.bottom_pane.is_task_running() {
-            self.bottom_pane.update_status_text(line);
-        }
+    fn request_redraw(&mut self) {
+        self.frame_requester.schedule_frame();
     }
 
-    fn request_redraw(&mut self) {
-        self.app_event_tx.send(AppEvent::RequestRedraw);
+    pub(crate) fn add_diff_in_progress(&mut self) {
+        self.bottom_pane.set_task_running(true);
+        self.bottom_pane
+            .update_status_text("computing diff".to_string());
+        self.request_redraw();
     }
 
     pub(crate) fn add_diff_output(&mut self, diff_output: String) {
-        self.add_to_history(HistoryCell::new_diff_output(diff_output.clone()));
+        self.bottom_pane.set_task_running(false);
+        self.add_to_history(history_cell::new_diff_output(diff_output));
+        self.mark_needs_redraw();
     }
 
     pub(crate) fn add_status_output(&mut self) {
-        self.add_to_history(HistoryCell::new_status_output(
+        self.add_to_history(history_cell::new_status_output(
             &self.config,
             &self.total_token_usage,
+            &self.session_id,
         ));
     }
 
-    pub(crate) fn add_prompts_output(&mut self) {
-        self.add_to_history(HistoryCell::new_prompts_output());
+    /// Open a popup to choose the model preset (model + reasoning effort).
+    pub(crate) fn open_model_popup(&mut self) {
+        let current_model = self.config.model.clone();
+        let current_effort = self.config.model_reasoning_effort;
+        let presets: &[ModelPreset] = builtin_model_presets();
+
+        let mut items: Vec<SelectionItem> = Vec::new();
+        for preset in presets.iter() {
+            let name = preset.label.to_string();
+            let description = Some(preset.description.to_string());
+            let is_current = preset.model == current_model && preset.effort == current_effort;
+            let model_slug = preset.model.to_string();
+            let effort = preset.effort;
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::CodexOp(Op::OverrideTurnContext {
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox_policy: None,
+                    model: Some(model_slug.clone()),
+                    effort: Some(effort),
+                    summary: None,
+                }));
+                tx.send(AppEvent::UpdateModel(model_slug.clone()));
+                tx.send(AppEvent::UpdateReasoningEffort(effort));
+            })];
+            items.push(SelectionItem {
+                name,
+                description,
+                is_current,
+                actions,
+            });
+        }
+
+        self.bottom_pane.show_selection_view(
+            "Select model and reasoning level".to_string(),
+            Some("Switch between OpenAI models for this and future Codex CLI session".to_string()),
+            Some("Press Enter to confirm or Esc to go back".to_string()),
+            items,
+        );
+    }
+
+    /// Open a popup to choose the approvals mode (ask for approval policy + sandbox policy).
+    pub(crate) fn open_approvals_popup(&mut self) {
+        let current_approval = self.config.approval_policy;
+        let current_sandbox = self.config.sandbox_policy.clone();
+        let mut items: Vec<SelectionItem> = Vec::new();
+        let presets: Vec<ApprovalPreset> = builtin_approval_presets();
+        for preset in presets.into_iter() {
+            let is_current =
+                current_approval == preset.approval && current_sandbox == preset.sandbox;
+            let approval = preset.approval;
+            let sandbox = preset.sandbox.clone();
+            let name = preset.label.to_string();
+            let description = Some(preset.description.to_string());
+            let actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+                tx.send(AppEvent::CodexOp(Op::OverrideTurnContext {
+                    cwd: None,
+                    approval_policy: Some(approval),
+                    sandbox_policy: Some(sandbox.clone()),
+                    model: None,
+                    effort: None,
+                    summary: None,
+                }));
+                tx.send(AppEvent::UpdateAskForApprovalPolicy(approval));
+                tx.send(AppEvent::UpdateSandboxPolicy(sandbox.clone()));
+            })];
+            items.push(SelectionItem {
+                name,
+                description,
+                is_current,
+                actions,
+            });
+        }
+
+        self.bottom_pane.show_selection_view(
+            "Select Approval Mode".to_string(),
+            None,
+            Some("Press Enter to confirm or Esc to go back".to_string()),
+            items,
+        );
+    }
+
+    /// Set the approval policy in the widget's config copy.
+    pub(crate) fn set_approval_policy(&mut self, policy: AskForApproval) {
+        self.config.approval_policy = policy;
+    }
+
+    /// Set the sandbox policy in the widget's config copy.
+    pub(crate) fn set_sandbox_policy(&mut self, policy: SandboxPolicy) {
+        self.config.sandbox_policy = policy;
+    }
+
+    /// Set the reasoning effort in the widget's config copy.
+    pub(crate) fn set_reasoning_effort(&mut self, effort: ReasoningEffortConfig) {
+        self.config.model_reasoning_effort = effort;
+    }
+
+    /// Set the model in the widget's config copy.
+    pub(crate) fn set_model(&mut self, model: String) {
+        self.config.model = model;
+    }
+
+    pub(crate) fn add_mcp_output(&mut self) {
+        if self.config.mcp_servers.is_empty() {
+            self.add_to_history(history_cell::empty_mcp_output());
+        } else {
+            self.submit_op(Op::ListMcpTools);
+        }
     }
 
     /// Forward file-search results to the bottom pane.
@@ -944,6 +983,10 @@ impl ChatWidget<'_> {
         }
     }
 
+    fn on_list_mcp_tools(&mut self, ev: McpListToolsResponseEvent) {
+        self.add_to_history(history_cell::new_mcp_tools_output(&self.config, ev.tools));
+    }
+
     /// Programmatically submit a user text message as if typed in the
     /// composer. The text will be added to conversation history and sent to
     /// the agent.
@@ -973,7 +1016,7 @@ impl ChatWidget<'_> {
     }
 }
 
-impl WidgetRef for &ChatWidget<'_> {
+impl WidgetRef for &ChatWidget {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let [active_cell_area, bottom_pane_area] = self.layout_areas(area);
         (&self.bottom_pane).render(bottom_pane_area, buf);
@@ -982,6 +1025,15 @@ impl WidgetRef for &ChatWidget<'_> {
         }
     }
 }
+
+const EXAMPLE_PROMPTS: [&str; 6] = [
+    "Explain this codebase",
+    "Summarize recent commits",
+    "Implement {feature}",
+    "Find and fix a bug in @filename",
+    "Write tests for @filename",
+    "Improve documentation in @filename",
+];
 
 fn add_token_usage(current_usage: &TokenUsage, new_usage: &TokenUsage) -> TokenUsage {
     let cached_input_tokens = match (
@@ -1009,6 +1061,36 @@ fn add_token_usage(current_usage: &TokenUsage, new_usage: &TokenUsage) -> TokenU
         reasoning_output_tokens,
         total_tokens: current_usage.total_tokens + new_usage.total_tokens,
     }
+}
+
+// Extract the first bold (Markdown) element in the form **...** from `s`.
+// Returns the inner text if found; otherwise `None`.
+fn extract_first_bold(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            let start = i + 2;
+            let mut j = start;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b'*' && bytes[j + 1] == b'*' {
+                    // Found closing **
+                    let inner = &s[start..j];
+                    let trimmed = inner.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    } else {
+                        return None;
+                    }
+                }
+                j += 1;
+            }
+            // No closing; stop searching (wait for more deltas)
+            return None;
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
