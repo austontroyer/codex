@@ -1,0 +1,35 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *' # daily at 03:17 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run sync script
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/sync-upstream.sh || true
+
+      - name: Summary
+        run: |
+          echo "If a sync branch was created, a PR should be open." >> $GITHUB_STEP_SUMMARY
+

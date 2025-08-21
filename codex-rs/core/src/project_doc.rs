@@ -12,12 +12,11 @@
 //!     that order.
 //! 3.  We do **not** walk past the Git root.
 
-use crate::config::Config;
+use crate::config::{Config, load_config_as_toml};
+use crate::git_info::collect_git_info;
 use std::path::PathBuf;
 use tokio::io::AsyncReadExt;
 use tracing::error;
-
-/// Currently, we only match the filename `AGENTS.md` exactly.
 const CANDIDATE_FILENAMES: &[&str] = &["AGENTS.md"];
 
 /// When both `Config::instructions` and the project doc are present, they will
@@ -27,11 +26,10 @@ const PROJECT_DOC_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 /// Combines `Config::instructions` and `AGENTS.md` (if present) into a single
 /// string of instructions.
 pub(crate) async fn get_user_instructions(config: &Config) -> Option<String> {
-    match read_project_docs(config).await {
+    // Combine explicit user_instructions with AGENTS.md if present.
+    let mut combined = match read_project_docs(config).await {
         Ok(Some(project_doc)) => match &config.user_instructions {
-            Some(original_instructions) => Some(format!(
-                "{original_instructions}{PROJECT_DOC_SEPARATOR}{project_doc}"
-            )),
+            Some(original_instructions) => Some(format!("{original_instructions}{PROJECT_DOC_SEPARATOR}{project_doc}")),
             None => Some(project_doc),
         },
         Ok(None) => config.user_instructions.clone(),
@@ -39,7 +37,30 @@ pub(crate) async fn get_user_instructions(config: &Config) -> Option<String> {
             error!("error trying to find project doc: {e:#}");
             config.user_instructions.clone()
         }
+    };
+
+    // Append repository-specific instructions, if configured for the current repo URL.
+    if let Some(git_info) = collect_git_info(&config.cwd).await {
+        if let Some(repo_url) = git_info.repository_url {
+            if let Ok(toml) = load_config_as_toml(&config.codex_home) {
+                if let Some(repo_table) = toml.get("repositories").and_then(|v| v.get(&repo_url)) {
+                    if let Some(extra) = repo_table.get("instructions").and_then(|v| v.as_str()).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                        let sep = format!("
+
+--- repo-instructions: {} ---
+
+", repo_url);
+                        combined = Some(match combined {
+                            Some(mut c) => { c.push_str(&sep); c.push_str(extra); c }
+                            None => extra.to_string(),
+                        });
+                    }
+                }
+            }
+        }
     }
+
+    combined
 }
 
 /// Attempt to locate and load the project documentation.

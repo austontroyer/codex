@@ -442,6 +442,20 @@ You can give Codex extra instructions and guidance using `AGENTS.md` files. Code
 2. `AGENTS.md` at repo root - shared project notes
 3. `AGENTS.md` in the current working directory - sub-folder/feature specifics
 
+Per-repo instructions via config
+
+You can also define custom instructions that only apply when you are working inside a specific Git repository. Add them to your `~/.codex/config.toml` under the `repositories` table, keyed by the repository URL:
+
+```toml
+[repositories."https://github.com/owner/repo"]
+instructions = """
+When working in this repo, prefer pnpm over npm.
+Avoid modifying files in legacy/ without approval.
+"""
+```
+
+Codex automatically detects the current repo URL (from your `origin` remote) and appends these instructions to the prompt, after any `AGENTS.md` content. Remove or edit the entry to update behavior. If the repository has multiple remotes, make sure `origin` points to the canonical URL you want to match.
+
 ---
 
 ## Non-interactive / CI mode
