@@ -1,5 +1,6 @@
 use std::io::BufRead;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -7,6 +8,7 @@ use codex_login::AuthMode;
 use codex_login::CodexAuth;
 use eventsource_stream::Eventsource;
 use futures::prelude::*;
+use regex_lite::Regex;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,12 +29,11 @@ use crate::client_common::ResponseStream;
 use crate::client_common::ResponsesApiRequest;
 use crate::client_common::create_reasoning_param_for_request;
 use crate::config::Config;
-use crate::config_types::ReasoningEffort as ReasoningEffortConfig;
-use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::error::UsageLimitReachedError;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
+use crate::model_family::ModelFamily;
 use crate::model_provider_info::ModelProviderInfo;
 use crate::model_provider_info::WireApi;
 use crate::models::ResponseItem;
@@ -40,6 +41,8 @@ use crate::openai_tools::create_tools_json_for_responses_api;
 use crate::protocol::TokenUsage;
 use crate::user_agent::get_codex_user_agent;
 use crate::util::backoff;
+use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
@@ -49,10 +52,12 @@ struct ErrorResponse {
 
 #[derive(Debug, Deserialize)]
 struct Error {
-    r#type: String,
+    r#type: Option<String>,
+    code: Option<String>,
+    message: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ModelClient {
     config: Arc<Config>,
     auth: Option<CodexAuth>,
@@ -203,11 +208,7 @@ impl ModelClient {
                 req_builder = req_builder.header("chatgpt-account-id", account_id);
             }
 
-            let originator = self
-                .config
-                .internal_originator
-                .as_deref()
-                .unwrap_or("codex_cli_rs");
+            let originator = &self.config.responses_originator_header;
             req_builder = req_builder.header("originator", originator);
             req_builder = req_builder.header("User-Agent", get_codex_user_agent(Some(originator)));
 
@@ -247,6 +248,12 @@ impl ModelClient {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
 
+                    if status == StatusCode::UNAUTHORIZED
+                        && let Some(a) = auth.as_ref()
+                    {
+                        let _ = a.refresh_token().await;
+                    }
+
                     // The OpenAI Responses endpoint returns structured JSON bodies even for 4xx/5xx
                     // errors. When we bubble early with only the HTTP status the caller sees an opaque
                     // "unexpected status 400 Bad Request" which makes debugging nearly impossible.
@@ -254,7 +261,10 @@ impl ModelClient {
                     // exact error message (e.g. "Unknown parameter: 'input[0].metadata'"). The body is
                     // small and this branch only runs on error paths so the extra allocation is
                     // negligible.
-                    if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
+                    if !(status == StatusCode::TOO_MANY_REQUESTS
+                        || status == StatusCode::UNAUTHORIZED
+                        || status.is_server_error())
+                    {
                         // Surface the error body to callers. Use `unwrap_or_default` per Clippy.
                         let body = res.text().await.unwrap_or_default();
                         return Err(CodexErr::UnexpectedStatus(status, body));
@@ -263,14 +273,18 @@ impl ModelClient {
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let body = res.json::<ErrorResponse>().await.ok();
                         if let Some(ErrorResponse {
-                            error: Error { r#type, .. },
+                            error:
+                                Error {
+                                    r#type: Some(error_type),
+                                    ..
+                                },
                         }) = body
                         {
-                            if r#type == "usage_limit_reached" {
+                            if error_type == "usage_limit_reached" {
                                 return Err(CodexErr::UsageLimitReached(UsageLimitReachedError {
                                     plan_type: auth.and_then(|a| a.get_plan_type()),
                                 }));
-                            } else if r#type == "usage_not_included" {
+                            } else if error_type == "usage_not_included" {
                                 return Err(CodexErr::UsageNotIncluded);
                             }
                         }
@@ -302,6 +316,30 @@ impl ModelClient {
 
     pub fn get_provider(&self) -> ModelProviderInfo {
         self.provider.clone()
+    }
+
+    /// Returns the currently configured model slug.
+    pub fn get_model(&self) -> String {
+        self.config.model.clone()
+    }
+
+    /// Returns the currently configured model family.
+    pub fn get_model_family(&self) -> ModelFamily {
+        self.config.model_family.clone()
+    }
+
+    /// Returns the current reasoning effort setting.
+    pub fn get_reasoning_effort(&self) -> ReasoningEffortConfig {
+        self.effort
+    }
+
+    /// Returns the current reasoning summary setting.
+    pub fn get_reasoning_summary(&self) -> ReasoningSummaryConfig {
+        self.summary
+    }
+
+    pub fn get_auth(&self) -> Option<CodexAuth> {
+        self.auth.clone()
     }
 }
 
@@ -366,13 +404,14 @@ async fn process_sse<S>(
     // If the stream stays completely silent for an extended period treat it as disconnected.
     // The response id returned from the "complete" message.
     let mut response_completed: Option<ResponseCompleted> = None;
+    let mut response_error: Option<CodexErr> = None;
 
     loop {
         let sse = match timeout(idle_timeout, stream.next()).await {
             Ok(Some(Ok(sse))) => sse,
             Ok(Some(Err(e))) => {
                 debug!("SSE Error: {e:#}");
-                let event = CodexErr::Stream(e.to_string());
+                let event = CodexErr::Stream(e.to_string(), None);
                 let _ = tx_event.send(Err(event)).await;
                 return;
             }
@@ -390,9 +429,10 @@ async fn process_sse<S>(
                     }
                     None => {
                         let _ = tx_event
-                            .send(Err(CodexErr::Stream(
+                            .send(Err(response_error.unwrap_or(CodexErr::Stream(
                                 "stream closed before response.completed".into(),
-                            )))
+                                None,
+                            ))))
                             .await;
                     }
                 }
@@ -400,7 +440,10 @@ async fn process_sse<S>(
             }
             Err(_) => {
                 let _ = tx_event
-                    .send(Err(CodexErr::Stream("idle timeout waiting for SSE".into())))
+                    .send(Err(CodexErr::Stream(
+                        "idle timeout waiting for SSE".into(),
+                        None,
+                    )))
                     .await;
                 return;
             }
@@ -478,15 +521,25 @@ async fn process_sse<S>(
             }
             "response.failed" => {
                 if let Some(resp_val) = event.response {
-                    let error = resp_val
-                        .get("error")
-                        .and_then(|v| v.get("message"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("response.failed event received");
+                    response_error = Some(CodexErr::Stream(
+                        "response.failed event received".to_string(),
+                        None,
+                    ));
 
-                    let _ = tx_event
-                        .send(Err(CodexErr::Stream(error.to_string())))
-                        .await;
+                    let error = resp_val.get("error");
+
+                    if let Some(error) = error {
+                        match serde_json::from_value::<Error>(error.clone()) {
+                            Ok(error) => {
+                                let delay = try_parse_retry_after(&error);
+                                let message = error.message.unwrap_or_default();
+                                response_error = Some(CodexErr::Stream(message, delay));
+                            }
+                            Err(e) => {
+                                debug!("failed to parse ErrorResponse: {e}");
+                            }
+                        }
+                    }
                 }
             }
             // Final response completed – includes array of output items & id
@@ -550,10 +603,42 @@ async fn stream_from_fixture(
     Ok(ResponseStream { rx_event })
 }
 
+fn rate_limit_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+
+    #[expect(clippy::unwrap_used)]
+    RE.get_or_init(|| Regex::new(r"Please try again in (\d+(?:\.\d+)?)(s|ms)").unwrap())
+}
+
+fn try_parse_retry_after(err: &Error) -> Option<Duration> {
+    if err.code != Some("rate_limit_exceeded".to_string()) {
+        return None;
+    }
+
+    // parse the Please try again in 1.898s format using regex
+    let re = rate_limit_regex();
+    if let Some(message) = &err.message
+        && let Some(captures) = re.captures(message)
+    {
+        let seconds = captures.get(1);
+        let unit = captures.get(2);
+
+        if let (Some(value), Some(unit)) = (seconds, unit) {
+            let value = value.as_str().parse::<f64>().ok()?;
+            let unit = unit.as_str();
+
+            if unit == "s" {
+                return Some(Duration::from_secs_f64(value));
+            } else if unit == "ms" {
+                return Some(Duration::from_millis(value as u64));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
     use super::*;
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -735,8 +820,44 @@ mod tests {
         matches!(events[0], Ok(ResponseEvent::OutputItemDone(_)));
 
         match &events[1] {
-            Err(CodexErr::Stream(msg)) => {
+            Err(CodexErr::Stream(msg, _)) => {
                 assert_eq!(msg, "stream closed before response.completed")
+            }
+            other => panic!("unexpected second event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn error_when_error_event() {
+        let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894","object":"response","created_at":1755041560,"status":"failed","background":false,"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for gpt-5 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."}, "usage":null,"user":null,"metadata":{}}}"#;
+
+        let sse1 = format!("event: response.failed\ndata: {raw_error}\n\n");
+        let provider = ModelProviderInfo {
+            name: "test".to_string(),
+            base_url: Some("https://test.com".to_string()),
+            env_key: Some("TEST_API_KEY".to_string()),
+            env_key_instructions: None,
+            wire_api: WireApi::Responses,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: Some(0),
+            stream_max_retries: Some(0),
+            stream_idle_timeout_ms: Some(1000),
+            requires_openai_auth: false,
+        };
+
+        let events = collect_events(&[sse1.as_bytes()], provider).await;
+
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            Err(CodexErr::Stream(msg, delay)) => {
+                assert_eq!(
+                    msg,
+                    "Rate limit reached for gpt-5 in organization org-AAA on tokens per min (TPM): Limit 30000, Used 22999, Requested 12528. Please try again in 11.054s. Visit https://platform.openai.com/account/rate-limits to learn more."
+                );
+                assert_eq!(*delay, Some(Duration::from_secs_f64(11.054)));
             }
             other => panic!("unexpected second event: {other:?}"),
         }
@@ -839,5 +960,28 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn test_try_parse_retry_after() {
+        let err = Error {
+            r#type: None,
+            message: Some("Rate limit reached for gpt-5 in organization org- on tokens per min (TPM): Limit 1, Used 1, Requested 19304. Please try again in 28ms. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
+            code: Some("rate_limit_exceeded".to_string()),
+        };
+
+        let delay = try_parse_retry_after(&err);
+        assert_eq!(delay, Some(Duration::from_millis(28)));
+    }
+
+    #[test]
+    fn test_try_parse_retry_after_no_delay() {
+        let err = Error {
+            r#type: None,
+            message: Some("Rate limit reached for gpt-5 in organization <ORG> on tokens per min (TPM): Limit 30000, Used 6899, Requested 24050. Please try again in 1.898s. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
+            code: Some("rate_limit_exceeded".to_string()),
+        };
+        let delay = try_parse_retry_after(&err);
+        assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
     }
 }

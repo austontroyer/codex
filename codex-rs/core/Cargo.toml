@@ -19,16 +19,17 @@ chrono = { version = "0.4", features = ["serde"] }
 codex-apply-patch = { path = "../apply-patch" }
 codex-login = { path = "../login" }
 codex-mcp-client = { path = "../mcp-client" }
+codex-protocol = { path = "../protocol" }
 dirs = "6"
 env-flags = "0.1.1"
 eventsource-stream = "0.2.3"
-fs2 = "0.4.3"
 futures = "0.3"
-libc = "0.2.174"
+libc = "0.2.175"
 mcp-types = { path = "../mcp-types" }
 mime_guess = "2.0"
 os_info = "3.12.0"
 rand = "0.9"
+regex-lite = "0.1.6"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 regex-lite = "0.1.6"
 shlex = "1.3.0"
@@ -71,13 +72,15 @@ openssl-sys = { version = "*", features = ["vendored"] }
 [target.aarch64-unknown-linux-musl.dependencies]
 openssl-sys = { version = "*", features = ["vendored"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+which = "6"
+
 [dev-dependencies]
 assert_cmd = "2"
 core_test_support = { path = "tests/common" }
 maplit = "1.0.2"
 predicates = "3"
 pretty_assertions = "1.4.1"
-regex-lite = "0.1.6"
 tempfile = "3"
 tokio-test = "0.4"
 walkdir = "2.5.0"

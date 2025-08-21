@@ -213,7 +213,9 @@ async fn process_chat_sse<S>(
         let sse = match timeout(idle_timeout, stream.next()).await {
             Ok(Some(Ok(ev))) => ev,
             Ok(Some(Err(e))) => {
-                let _ = tx_event.send(Err(CodexErr::Stream(e.to_string()))).await;
+                let _ = tx_event
+                    .send(Err(CodexErr::Stream(e.to_string(), None)))
+                    .await;
                 return;
             }
             Ok(None) => {
@@ -228,7 +230,10 @@ async fn process_chat_sse<S>(
             }
             Err(_) => {
                 let _ = tx_event
-                    .send(Err(CodexErr::Stream("idle timeout waiting for SSE".into())))
+                    .send(Err(CodexErr::Stream(
+                        "idle timeout waiting for SSE".into(),
+                        None,
+                    )))
                     .await;
                 return;
             }
@@ -285,13 +290,12 @@ async fn process_chat_sse<S>(
                 .get("delta")
                 .and_then(|d| d.get("content"))
                 .and_then(|c| c.as_str())
+                && !content.is_empty()
             {
-                if !content.is_empty() {
-                    assistant_text.push_str(content);
-                    let _ = tx_event
-                        .send(Ok(ResponseEvent::OutputTextDelta(content.to_string())))
-                        .await;
-                }
+                assistant_text.push_str(content);
+                let _ = tx_event
+                    .send(Ok(ResponseEvent::OutputTextDelta(content.to_string())))
+                    .await;
             }
 
             // Forward any reasoning/thinking deltas if present.
@@ -328,27 +332,25 @@ async fn process_chat_sse<S>(
                 .get("delta")
                 .and_then(|d| d.get("tool_calls"))
                 .and_then(|tc| tc.as_array())
+                && let Some(tool_call) = tool_calls.first()
             {
-                if let Some(tool_call) = tool_calls.first() {
-                    // Mark that we have an active function call in progress.
-                    fn_call_state.active = true;
+                // Mark that we have an active function call in progress.
+                fn_call_state.active = true;
 
-                    // Extract call_id if present.
-                    if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
-                        fn_call_state.call_id.get_or_insert_with(|| id.to_string());
+                // Extract call_id if present.
+                if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
+                    fn_call_state.call_id.get_or_insert_with(|| id.to_string());
+                }
+
+                // Extract function details if present.
+                if let Some(function) = tool_call.get("function") {
+                    if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
+                        fn_call_state.name.get_or_insert_with(|| name.to_string());
                     }
 
-                    // Extract function details if present.
-                    if let Some(function) = tool_call.get("function") {
-                        if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
-                            fn_call_state.name.get_or_insert_with(|| name.to_string());
-                        }
-
-                        if let Some(args_fragment) =
-                            function.get("arguments").and_then(|a| a.as_str())
-                        {
-                            fn_call_state.arguments.push_str(args_fragment);
-                        }
+                    if let Some(args_fragment) = function.get("arguments").and_then(|a| a.as_str())
+                    {
+                        fn_call_state.arguments.push_str(args_fragment);
                     }
                 }
             }
@@ -486,15 +488,14 @@ where
                         // Only use the final assistant message if we have not
                         // seen any deltas; otherwise, deltas already built the
                         // cumulative text and this would duplicate it.
-                        if this.cumulative.is_empty() {
-                            if let crate::models::ResponseItem::Message { content, .. } = &item {
-                                if let Some(text) = content.iter().find_map(|c| match c {
-                                    crate::models::ContentItem::OutputText { text } => Some(text),
-                                    _ => None,
-                                }) {
-                                    this.cumulative.push_str(text);
-                                }
-                            }
+                        if this.cumulative.is_empty()
+                            && let crate::models::ResponseItem::Message { content, .. } = &item
+                            && let Some(text) = content.iter().find_map(|c| match c {
+                                crate::models::ContentItem::OutputText { text } => Some(text),
+                                _ => None,
+                            })
+                        {
+                            this.cumulative.push_str(text);
                         }
 
                         // Swallow assistant message here; emit on Completed.
