@@ -256,10 +256,8 @@ fn read_image_for_upload(path: &std::path::Path) -> anyhow::Result<(String, Vec<
     if is_heic {
         // Convert to PNG using `sips`, which is available on macOS by default.
         use std::process::Command;
-        use tempfile::NamedTempFile;
-
-        let tmp = NamedTempFile::new()?;
-        let out_path = tmp.path().with_extension("png");
+        let tmpdir = tempfile::tempdir()?;
+        let out_path = tmpdir.path().join("codex-heic-convert.png");
         let status = Command::new("sips")
             .arg("-s")
             .arg("format")
@@ -271,6 +269,12 @@ fn read_image_for_upload(path: &std::path::Path) -> anyhow::Result<(String, Vec<
         match status {
             Ok(s) if s.success() => {
                 let bytes = std::fs::read(&out_path)?;
+                // Quick sanity: verify PNG signature to avoid server 400s on bad output.
+                let is_png = bytes.len() > 8
+                    && &bytes[0..8] == b"\x89PNG\r\n\x1a\n";
+                if !is_png {
+                    anyhow::bail!("sips output is not valid PNG bytes");
+                }
                 return Ok(("image/png".to_string(), bytes));
             }
             Ok(s) => {
