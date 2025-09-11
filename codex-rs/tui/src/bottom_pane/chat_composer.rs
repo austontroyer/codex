@@ -507,7 +507,8 @@ impl ChatComposer {
                 if is_image {
                     // Determine dimensions; if that fails fall back to normal path insertion.
                     let path_buf = PathBuf::from(&sel_path);
-                    if let Ok((w, h)) = image::image_dimensions(&path_buf) {
+                    let dims = Self::dimensions_for_path(&path_buf, &sel_path);
+                    if let Some((w, h)) = dims {
                         // Remove the current @token (mirror logic from insert_selected_path without inserting text)
                         // using the flat text and byte-offset cursor API.
                         let cursor_offset = self.textarea.cursor();
@@ -540,6 +541,7 @@ impl ChatComposer {
                         {
                             Some(ext) if ext == "png" => "PNG",
                             Some(ext) if ext == "jpg" || ext == "jpeg" => "JPEG",
+                            Some(ext) if ext == "heic" || ext == "heif" => "HEIC",
                             _ => "IMG",
                         };
                         self.attach_image(path_buf.clone(), w, h, format_label);
@@ -563,7 +565,63 @@ impl ChatComposer {
 
     fn is_image_path(path: &str) -> bool {
         let lower = path.to_ascii_lowercase();
-        lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+        lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".heic")
+            || lower.ends_with(".heif")
+    }
+
+    fn dimensions_for_path(path: &Path, path_str: &str) -> Option<(u32, u32)> {
+        if let Ok((w, h)) = image::image_dimensions(path) {
+            return Some((w, h));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if Self::is_heic_path(path_str) {
+                return Self::heic_dimensions_with_sips(path);
+            }
+        }
+        None
+    }
+
+    fn is_heic_path(path: &str) -> bool {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".heic")
+            || lower.ends_with(".heif")
+            || lower.ends_with(".heics")
+            || lower.ends_with(".heifs")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn heic_dimensions_with_sips(path: &Path) -> Option<(u32, u32)> {
+        use std::process::Command;
+        let output = Command::new("sips")
+            .arg("-g")
+            .arg("pixelWidth")
+            .arg("-g")
+            .arg("pixelHeight")
+            .arg(path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut w: Option<u32> = None;
+        let mut h: Option<u32> = None;
+        for line in stdout.lines() {
+            if let Some(rest) = line.strip_prefix("  pixelWidth: ") {
+                w = rest.trim().parse::<u32>().ok();
+            }
+            if let Some(rest) = line.strip_prefix("  pixelHeight: ") {
+                h = rest.trim().parse::<u32>().ok();
+            }
+        }
+        match (w, h) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        }
     }
 
     /// Extract the `@token` that the cursor is currently positioned on, if any.

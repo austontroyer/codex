@@ -11,6 +11,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+anyhow = "1"
 base64 = "0.22.1"
 icu_decimal = "2.0.0"
 icu_locale_core = "2.0.0"
@@ -24,11 +25,11 @@ strum_macros = "0.27.2"
 sys-locale = "0.3.2"
 tracing = "0.1.41"
 ts-rs = { version = "11", features = ["uuid-impl", "serde-json-impl", "no-serde-warnings"] }
+tempfile = "3"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
-tempfile = "3"
 
 [package.metadata.cargo-shear]
 # Required because the not imported as strum_macros in non-nightly builds.

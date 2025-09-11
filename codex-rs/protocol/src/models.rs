@@ -214,12 +214,8 @@ impl From<Vec<InputItem>> for ResponseInputItem {
                 .filter_map(|c| match c {
                     InputItem::Text { text } => Some(ContentItem::InputText { text }),
                     InputItem::Image { image_url } => Some(ContentItem::InputImage { image_url }),
-                    InputItem::LocalImage { path } => match std::fs::read(&path) {
-                        Ok(bytes) => {
-                            let mime = mime_guess::from_path(&path)
-                                .first()
-                                .map(|m| m.essence_str().to_owned())
-                                .unwrap_or_else(|| "application/octet-stream".to_string());
+                    InputItem::LocalImage { path } => match read_image_for_upload(&path) {
+                        Ok((mime, bytes)) => {
                             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
                             Some(ContentItem::InputImage {
                                 image_url: format!("data:{mime};base64,{encoded}"),
@@ -227,7 +223,7 @@ impl From<Vec<InputItem>> for ResponseInputItem {
                         }
                         Err(err) => {
                             tracing::warn!(
-                                "Skipping image {} – could not read file: {}",
+                                "Skipping image {} – could not prepare for upload: {}",
                                 path.display(),
                                 err
                             );
@@ -238,6 +234,61 @@ impl From<Vec<InputItem>> for ResponseInputItem {
                 .collect::<Vec<ContentItem>>(),
         }
     }
+}
+
+/// Read a local image file into bytes and determine the MIME type suitable for upload.
+///
+/// - On macOS, `.heic`/`.heif` images are converted to PNG via `sips` to maximize compatibility.
+/// - Otherwise, bytes are read as-is and MIME type is guessed from the path.
+fn read_image_for_upload(path: &std::path::Path) -> anyhow::Result<(String, Vec<u8>)> {
+    use std::ffi::OsStr;
+    let ext = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|s| s.to_ascii_lowercase());
+
+    let is_heic = matches!(
+        ext.as_deref(),
+        Some("heic") | Some("heif") | Some("heics") | Some("heifs")
+    );
+
+    #[cfg(target_os = "macos")]
+    if is_heic {
+        // Convert to PNG using `sips`, which is available on macOS by default.
+        use std::process::Command;
+        use tempfile::NamedTempFile;
+
+        let tmp = NamedTempFile::new()?;
+        let out_path = tmp.path().with_extension("png");
+        let status = Command::new("sips")
+            .arg("-s")
+            .arg("format")
+            .arg("png")
+            .arg(path)
+            .arg("--out")
+            .arg(&out_path)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                let bytes = std::fs::read(&out_path)?;
+                return Ok(("image/png".to_string(), bytes));
+            }
+            Ok(s) => {
+                anyhow::bail!("sips failed with exit status {s}");
+            }
+            Err(e) => {
+                anyhow::bail!("failed to invoke sips: {e}");
+            }
+        }
+    }
+
+    // Default path: read bytes directly and guess MIME type from extension.
+    let bytes = std::fs::read(path)?;
+    let mime = mime_guess::from_path(path)
+        .first()
+        .map(|m| m.essence_str().to_owned())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    Ok((mime, bytes))
 }
 
 /// If the `name` of a `ResponseItem::FunctionCall` is either `container.exec`
